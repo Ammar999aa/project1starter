@@ -5,153 +5,97 @@
 
 #include "consts.h"
 
+// Packet Construction
+static void packet_create(packet *pkt, uint16_t seq, uint16_t ack, uint16_t len, uint16_t win, uint16_t flags, uint8_t *payload)
+{
+    pkt->seq = htons(seq);
+    pkt->ack = htons(ack);
+    pkt->length = htons(len);
+    pkt->win = htons(win);
+    pkt->flags = flags;
+    pkt->unused = 0;
+    if (payload && len > 0)
+    {
+        memcpy(pkt->payload, payload, len);
+    }
+}
+
+// Packet Sender
+static ssize_t packet_send(int sockfd, struct sockaddr_in *addr, packet *pkt)
+{
+    return sendto(sockfd, pkt, sizeof(packet) + ntohs(pkt->length), 0, (struct sockaddr *)addr, sizeof(*addr));
+}
+
+// Packer Receiver
+static ssize_t packet_receive(int sockfd, struct sockaddr_in *addr, packet *pkt)
+{
+    socklen_t addr_len = sizeof(*addr);
+    return recvfrom(sockfd, pkt, sizeof(packet) + MAX_PAYLOAD, 0, (struct sockaddr *)addr, &addr_len);
+}
+
+// Handshake Function
+static int handshake(int sockfd, struct sockaddr_in *addr, int type)
+{
+    packet pkt;
+    uint16_t server_seq = 0;
+    uint16_t client_seq = rand() % 1000;
+
+    if (type == CLIENT)
+    {
+        // Send SYN
+        packet_create(&pkt, client_seq, 0, 0, MAX_PAYLOAD, SYN, NULL);
+        packet_send(sockfd, addr, &pkt);
+
+        // Receive ACK
+        packet_receive(sockfd, addr, &pkt);
+        if (!(pkt.flags & SYN) || !(pkt.flags & ACK))
+            return -1;
+
+        // Send ACK
+        server_seq = ntohs(pkt.seq);
+        if (ntohs(pkt.length) > 0)
+        {
+            packet_create(&pkt, client_seq + 1, server_seq + 1, 0, MAX_PAYLOAD, ACK, NULL);
+        }
+        else
+        {
+            packet_create(&pkt, 0, server_seq + 1, 0, MAX_PAYLOAD, ACK, NULL);
+        }
+        packet_send(sockfd, addr, &pkt);
+    }
+    else
+    { // SERVER
+        packet_receive(sockfd, addr, &pkt);
+        if (!(pkt.flags & SYN))
+            return -1;
+
+        client_seq = ntohs(pkt.seq);
+        server_seq = rand() % 1000;
+        packet_create(&pkt, server_seq, client_seq + 1, 0, MAX_PAYLOAD, (SYN | ACK), NULL);
+        packet_send(sockfd, addr, &pkt);
+
+        packet_receive(sockfd, addr, &pkt);
+        if (!(pkt.flags & ACK))
+            return -1;
+    }
+    return 0;
+}
+
 // Main function of transport layer; never quits
 void listen_loop(int sockfd, struct sockaddr_in *addr, int type,
                  ssize_t (*input_p)(uint8_t *, size_t),
                  void (*output_p)(uint8_t *, size_t))
 {
+    if (handshake(sockfd, addr, type) != 0)
+    {
+        fprintf(stderr, "Handshake failed\n");
+        return;
+    }
 
-    // Set-Up Variables
-    packet p_data; // Packet struct holding the sent/recieved data
-    packet p_ack;  // Packet struct for acknowledgements
-
-    struct sockaddr_in remote_addr;           // Remote c/s address
-    socklen_t addr_len = sizeof(remote_addr); // Length of the address
-    char buffer[sizeof(packet) + MAX_PAYLOAD] = {0};
-    packet *pkt = (packet *)buffer;
-
-    uint16_t seq_num = rand() % 1000; // Initial Range of 0-999, (CHANGE?)
-    uint16_t expect_seq = 0;
-    uint16_t server_seq = 0;
-    uint16_t ack_num = 0;
-    uint16_t window_size = MAX_WINDOW;
-
-    // Perform handshake before entering infinite main loop
-    perform_handshake(sockfd, &remote_addr, type, &seq_num, &server_seq, &expect_seq, input_p, output_p);
+    packet pkt;
+    uint8_t buffer[MAX_PAYLOAD];
 
     while (true)
     {
-        // Recieve packet
-        int bytes_recvd = recvfrom(sockfd, pkt, sizeof(packet) + MAX_PAYLOAD, 0, (struct sockaddr *)&remote_addr, &addr_len);
-        if (bytes_recvd < sizeof(packet))
-        {
-            continue; // Ignore incomplete packets
-        }
-
-        uint16_t seq = ntohs(pkt->seq);
-        uint16_t ack = ntohs(pkt->ack);
-        uint16_t length = ntohs(pkt->length);
-        uint16_t win = ntohs(pkt->win);
-        uint16_t flags = pkt->flags;
-
-        bool syn = flags & 1;
-        bool ack_flag = (flags >> 1) & 1;
-        bool parity = (flags >> 2) & 1;
-
-        // Process payload
-        if (length > 0)
-            output_p(pkt->payload, length);
-    }
-}
-
-void perform_handshake(int sockfd, struct sockaddr_in *remote_addr, int type,
-                       uint16_t *seq_num, uint16_t *server_seq, uint16_t *expect_seq,
-                       ssize_t (*input_p)(uint8_t *, size_t),
-                       void (*output_p)(uint8_t *, size_t))
-{
-
-    socklen_t addr_len = sizeof(*remote_addr);
-    uint8_t buffer[sizeof(packet) + MAX_PAYLOAD] = {0};
-    packet *pkt = (packet *)buffer;
-
-    if (type == CLIENT)
-    {
-        // Send SYN
-        uint8_t payload[MAX_PAYLOAD] = {0};
-        ssize_t payload_len = input_p(payload, MAX_PAYLOAD);
-
-        packet syn_pkt = {};
-        syn_pkt.seq = htons(*seq_num);
-        syn_pkt.ack = 0;
-        syn_pkt.flags = SYN;
-        syn_pkt.length = htons(payload_len);
-        memcpy(syn_pkt.payload, payload, payload_len);
-
-        sendto(sockfd, &syn_pkt, sizeof(packet) + payload_len, 0, (struct sockaddr *)remote_addr, &addr_len);
-
-        // Wait for server's SYN-ACK packet
-        while (true)
-        {
-            int bytes_recvd = recvfrom(sockfd, pkt, sizeof(packet) + MAX_PAYLOAD, 0,
-                                       (struct sockaddr *)remote_addr, &addr_len);
-            if (bytes_recvd < sizeof(packet))
-                continue;
-            if (pkt->flags == (SYN | ACK) && ntohs(pkt->ack) == *seq_num + 1)
-            {
-                *server_seq = ntohs(pkt->seq);
-                break;
-            }
-        }
-
-        // Send Final ACK
-        payload_len = input_p(payload, MAX_PAYLOAD);
-
-        packet ack_pkt = {0};
-        ack_pkt.seq = htons(0);
-        ack_pkt.ack = htons(*server_seq + 1);
-        ack_pkt.flags = ACK;
-        ack_pkt.length = htons(payload_len);
-        memcpy(ack_pkt.payload, payload, payload_len);
-
-        sendto(sockfd, &ack_pkt, sizeof(packet) + payload_len, 0, (struct sockaddr *)remote_addr, addr_len);
-    }
-    else if (type == SERVER)
-    {
-        // Wait for client SYN
-        while (true)
-        {
-            int bytes_recvd = recvfrom(sockfd, pkt, sizeof(packet) + MAX_PAYLOAD, 0,
-                                       (struct sockaddr *)remote_addr, &addr_len);
-            if (bytes_recvd < sizeof(packet))
-                continue;
-            if (pkt->flags == SYN)
-            {
-                *expect_seq = ntohs(pkt->seq) + 1;
-                uint16_t len = ntohs(pkt->length);
-                if (len > 0)
-                    output_p(pkt->payload, len);
-                break;
-            }
-        }
-
-        // Send SYN-ACK
-        *server_seq = rand() % 1000;
-        uint8_t payload[MAX_PAYLOAD] = {0};
-        ssize_t payload_len = input_p(payload, MAX_PAYLOAD);
-
-        packet syn_ack = {0};
-        syn_ack.seq = htons(*server_seq);
-        syn_ack.ack = htons(*expect_seq);
-        syn_ack.flags = SYN | ACK;
-        syn_ack.length = htons(payload_len);
-        memcpy(syn_ack.payload, payload, payload_len);
-
-        sendto(sockfd, &syn_ack, sizeof(packet) + payload_len, 0, (struct sockaddr *)remote_addr, addr_len);
-
-        // Wait for final ACK
-        while (true)
-        {
-            int bytes_recvd = recvfrom(sockfd, pkt, sizeof(packet) + MAX_PAYLOAD, 0,
-                                       (struct sockaddr *)remote_addr, &addr_len);
-            if (bytes_recvd < sizeof(packet))
-                continue;
-            if (pkt->flags == ACK && ntohs(pkt->ack) == *server_seq + 1)
-            {
-                uint16_t len = ntohs(pkt->length);
-                if (len > 0)
-                    output_p(pkt->payload, len);
-                break;
-            }
-        }
     }
 }
