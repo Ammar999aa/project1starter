@@ -75,7 +75,7 @@ static int handshake(int sockfd, struct sockaddr_in *addr, int type)
         packet_send(sockfd, addr, &pkt);
 
         packet_receive(sockfd, addr, &pkt);
-        if (!(pkt.flags & ACK))
+        if (!ntohs(pkt.flags & ACK))
             return -1;
     }
     return 0;
